@@ -1,4 +1,4 @@
-# Zero-Shot Off-Policy Algorithms
+# [Zero-Shot Off-Policy Learning](https://arxiv.org/pdf/2602.01962)
 
 # Overview
 This repository provides a PyTorch implementation of different baseline methods used in paper. It also provides a framework for training, evaluating, and comparing unsupervised zero-shot RL methods on proprioceptive- and pixel-based environments from the [DeepMind Control Suite](https://github.com/google-deepmind/dm_control) and [OGBench](https://github.com/seohongpark/ogbench). The implementation of baselines is discussed in detail in the [paper](https://arxiv.org/abs/2510.00739).
