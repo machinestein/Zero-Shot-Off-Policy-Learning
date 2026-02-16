@@ -1,0 +1,207 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the CC BY-NC 4.0 license found in the
+# LICENSE file in the root directory of this source tree.
+
+import copy
+import dataclasses
+from typing import Literal
+
+import tyro
+
+from metamotivo.envs.ogbench import ALL_TASKS
+from metamotivo.misc.launcher_utils import all_combinations_of_nested_dicts_for_sweep, flatten, launch_trials, setup_wandb_config
+
+BASE_CFG = {
+    "num_train_steps": 1_000_000,
+    "data": {
+        "name": "ogbench",
+        "domain": "cube-single-play-v0",
+        "obs_type": "state",
+        "buffer_type": "parallel",
+        "horizon": 5,
+    },
+    "env": {
+        "name": "ogbench",
+        "obs_type": "state",
+        "domain": "cube-single-play-v0",
+        "task": "cube-single-play-singletask-task1-v0",
+    },
+    "agent": {
+        "name": "RLDPFlowBCAgent",
+        "compile": True,
+        "model": {
+            "device": "cuda",
+            "obs_normalizer": {
+                "name": "IdentityNormalizerConfig",
+            },
+            "archi": {
+                "f": {
+                    "name": "ForwardArchi",
+                    "hidden_dim": 512,
+                    "hidden_layers": 2,
+                },
+                "actor": {
+                    "hidden_dim": 512,
+                    "hidden_layers": 2,
+                    "name": "noise_conditioned_actor",
+                },
+                "actor_vf": {
+                    "hidden_layers": 4,
+                    "hidden_dim": 512,
+                },
+                "b": {
+                    "name": "BackwardArchi",
+                    "hidden_dim": 512,
+                    "hidden_layers": 4,
+                    "norm": True,
+                },
+                "predictor": {
+                    "hidden_dim": 512,
+                    "hidden_layers": 2,
+                },
+                "left_encoder": {
+                    "name": "BackwardArchi",
+                    "hidden_dim": 512,
+                    "hidden_layers": 4,
+                    "norm": True,
+                },
+                "L_dim": 50,
+                "z_dim": 50,
+                "norm_z": True,
+            },
+            "actor_encode_obs": False,
+        },
+        "train": {
+            "batch_size": 256,
+            "discount": 0.99,
+            "ortho_coef": 1.0,
+            "f_target_tau": 0.005,
+            "b_target_tau": 0.005,
+        },
+    },
+}
+
+
+def sweep_antmaze():
+    conf = {
+        "seed": [3917, 3502, 8948, 9460, 4729, 2226, 1744, 7742, 4501, 6341],
+        "env.domain": [
+            "antmaze-medium-navigate-v0",
+            "antmaze-large-navigate-v0",
+            "antmaze-medium-stitch-v0",
+            "antmaze-large-stitch-v0",
+            "antmaze-medium-explore-v0",
+        ],
+        "agent.train.bc_coeff": [0.3],
+        "agent.train.ortho_coef": [0.001, 0.01],
+        "agent.train.lr_b": [1.0e-4, 1.0e-5],
+    }
+    return conf
+
+
+def sweep_cube():
+    conf = {
+        "seed": [3917, 3502, 8948, 9460, 4729, 2226, 1744, 7742, 4501, 6341],
+        "env.domain": [
+            "cube-single-play-v0",
+            "cube-double-play-v0",
+            "scene-play-v0",
+            "puzzle-3x3-play-v0",
+        ],
+        "agent.train.bc_coeff": [3.0],
+        "agent.train.ortho_coef": [0.01, 0.1],
+        "agent.train.lr_b": [1.0e-4, 1.0e-5],
+    }
+    return conf
+
+
+@dataclasses.dataclass
+class LaunchArgs:
+    # dataset and working paths
+    data_path: str = "/path/to/datasets"
+    workdir_root: str = "/path/to/workdir"
+    # wandb config
+    use_wandb: bool = False
+    wandb_gname: str | None = None
+    wandb_ename: str | None = None
+    wandb_pname: str | None = "td_jepa"
+    # specify to run sweeps
+    sweep_config: str | None = None
+    # instead of launching all experiments, only run the first one
+    first_only: bool = False
+    # print out the configs instead of running the experiments
+    dry: bool = False
+    # launch with slurm
+    slurm: bool = False
+    # launch with exca
+    exca: bool = False
+    # selects the depth of the left encoder
+    left_encoder: Literal["shallow", "deep"] = "deep"
+
+
+def main(args: LaunchArgs):
+    base_cfg = copy.deepcopy(BASE_CFG)
+    base_cfg["work_dir"] = args.workdir_root
+    base_cfg["data"]["dataset_root"] = args.data_path
+    match args.left_encoder:
+        case "shallow":
+            base_cfg["agent"]["model"]["archi"]["left_encoder"]["hidden_layers"] = 0
+            base_cfg["agent"]["model"]["archi"]["L_dim"] = 256
+        case "deep":
+            pass
+        case _:
+            raise NotImplementedError("Unknown left encoder configuration: ", args.left_encoder)
+
+    if args.sweep_config is None:
+        sweep_params = {}
+    else:
+        if args.sweep_config in globals().keys():
+            sweep_params = globals()[args.sweep_config]()
+        else:
+            raise RuntimeError("Unknown sweep configuration")
+
+    trials = []
+    for i, trial in enumerate(all_combinations_of_nested_dicts_for_sweep(sweep_params)):
+        trial = flatten(trial)
+        trial.update(
+            flatten(
+                {
+                    **setup_wandb_config(
+                        trial,
+                        base_cfg,
+                        args_use_wandb=args.use_wandb,
+                        args_wandb_pname=args.wandb_pname,
+                        args_wandb_gname=args.wandb_gname,
+                        args_wandb_ename=args.wandb_ename,
+                    ),
+                    "work_dir": f"{args.workdir_root}/{trial['env.domain']}/{i}",
+                    "data.domain": trial["env.domain"],
+                    "env.task": ALL_TASKS[trial["env.domain"]][0],
+                    "evaluations": [
+                        {
+                            "name": "ogbench_reward_eval",
+                            "shift_reward": 1,
+                            "env": {
+                                "name": "ogbench",
+                                "domain": trial["env.domain"],
+                                "task": ALL_TASKS[trial["env.domain"]][0],
+                            },
+                            "tasks": ALL_TASKS[trial["env.domain"]],
+                            "num_episodes": 10,
+                            "num_inference_samples": 10_000,
+                        },
+                    ],
+                }
+            )
+        )
+        trials.append(trial)
+
+    launch_trials(base_cfg, trials, args.first_only, args.dry, args.slurm, args.exca)
+
+
+if __name__ == "__main__":
+    args = tyro.cli(LaunchArgs)
+    main(args)
+    # uv run -m scripts.train.proprio.launch_rldp_ogbench --use_wandb --wandb_gname rldp_antmaze_proprio --data_path datasets --workdir_root results --sweep_config sweep_antmaze
+    # uv run -m scripts.train.proprio.launch_rldp_ogbench --use_wandb --wandb_gname rldp_cube_proprio --data_path datasets --workdir_root results --sweep_config sweep_cube
